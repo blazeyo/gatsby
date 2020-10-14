@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/camelcase */
 
-import uuidv4 from "uuid/v4"
+import uuidv4 from "uuid"
 import { trackCli } from "gatsby-telemetry"
 import signalExit from "signal-exit"
 import { Dispatch } from "redux"
@@ -31,6 +31,7 @@ import {
   getGlobalStatus,
 } from "./utils"
 import { IStructuredError } from "../../structured-errors/types"
+import { ErrorCategory } from "../../structured-errors/error-map"
 
 const ActivityStatusToLogLevel = {
   [ActivityStatuses.Interrupted]: ActivityLogLevels.Interrupted,
@@ -93,6 +94,7 @@ export const createLog = ({
   group,
   code,
   type,
+  category,
   filePath,
   location,
   docsUrl,
@@ -110,6 +112,7 @@ export const createLog = ({
   group?: string
   code?: string
   type?: string
+  category?: ErrorCategory
   filePath?: string
   location?: IStructuredError["location"]
   docsUrl?: string
@@ -130,6 +133,7 @@ export const createLog = ({
       group,
       code,
       type,
+      category,
       filePath,
       location,
       docsUrl,
@@ -160,6 +164,7 @@ export const createPendingActivity = ({
       payload: {
         id,
         type: ActivityTypes.Pending,
+        startTime: process.hrtime(),
         status,
       },
     },

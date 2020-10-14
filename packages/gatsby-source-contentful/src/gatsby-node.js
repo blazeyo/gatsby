@@ -2,6 +2,8 @@ const path = require(`path`)
 const isOnline = require(`is-online`)
 const _ = require(`lodash`)
 const fs = require(`fs-extra`)
+const { createClient } = require(`contentful`)
+const v8 = require(`v8`)
 
 const normalize = require(`./normalize`)
 const fetchData = require(`./fetch`)
@@ -45,75 +47,196 @@ exports.sourceNodes = async (
     cache,
     getCache,
     reporter,
+    schema,
+    parentSpan,
   },
   pluginOptions
 ) => {
-  const { createNode, deleteNode, touchNode, setPluginStatus } = actions
+  const { createNode, deleteNode, touchNode } = actions
 
-  const online = await isOnline()
-
-  // If the user knows they are offline, serve them cached result
-  // For prod builds though always fail if we can't get the latest data
-  if (
-    !online &&
-    process.env.GATSBY_CONTENTFUL_OFFLINE === `true` &&
-    process.env.NODE_ENV !== `production`
-  ) {
-    getNodes().forEach(node => {
-      if (node.internal.owner !== `gatsby-source-contentful`) {
-        return
-      }
-      touchNode({ nodeId: node.id })
-      if (node.localFile___NODE) {
-        // Prevent GraphQL type inference from crashing on this property
-        touchNode({ nodeId: node.localFile___NODE })
-      }
-    })
-
-    reporter.info(`Using Contentful Offline cache ⚠️`)
+  let currentSyncData, contentTypeItems, defaultLocale, locales, space
+  if (process.env.GATSBY_CONTENTFUL_EXPERIMENTAL_FORCE_CACHE) {
     reporter.info(
-      `Cache may be invalidated if you edit package.json, gatsby-node.js or gatsby-config.js files`
+      `GATSBY_CONTENTFUL_EXPERIMENTAL_FORCE_CACHE: Storing/loading remote data through \`` +
+        process.env.GATSBY_CONTENTFUL_EXPERIMENTAL_FORCE_CACHE +
+        `\` so Remote changes CAN NOT be detected!`
     )
-
-    return
   }
+  const forceCache = await fs.exists(
+    process.env.GATSBY_CONTENTFUL_EXPERIMENTAL_FORCE_CACHE
+  )
 
   const pluginConfig = createPluginConfig(pluginOptions)
+  const sourceId = `${pluginConfig.get(`spaceId`)}-${pluginConfig.get(
+    `environment`
+  )}`
 
-  const createSyncToken = () =>
-    `${pluginConfig.get(`spaceId`)}-${pluginConfig.get(
-      `environment`
-    )}-${pluginConfig.get(`host`)}`
+  const CACHE_SYNC_TOKEN = `contentful-sync-token-${sourceId}`
+  const CACHE_SYNC_DATA = `contentful-sync-data-${sourceId}`
 
-  // Get sync token if it exists.
-  let syncToken
-  if (
-    !pluginConfig.get(`forceFullSync`) &&
-    store.getState().status.plugins &&
-    store.getState().status.plugins[`gatsby-source-contentful`] &&
-    store.getState().status.plugins[`gatsby-source-contentful`][
-      createSyncToken()
-    ]
-  ) {
-    syncToken = store.getState().status.plugins[`gatsby-source-contentful`][
-      createSyncToken()
-    ]
+  /*
+   * Subsequent calls of Contentfuls sync API return only changed data.
+   *
+   * In some cases, especially when using rich-text fields, there can be data
+   * missing from referenced entries. This breaks the reference matching.
+   *
+   * To workround this, we cache the initial sync data and merge it
+   * with all data from subsequent syncs. Afterwards the references get
+   * resolved via the Contentful JS SDK.
+   */
+  let syncToken = await cache.get(CACHE_SYNC_TOKEN)
+  let previousSyncData = {
+    assets: [],
+    entries: [],
+  }
+  let cachedData = await cache.get(CACHE_SYNC_DATA)
+
+  if (cachedData) {
+    previousSyncData = cachedData
   }
 
-  const {
-    currentSyncData,
-    contentTypeItems,
-    defaultLocale,
-    locales,
-    space,
-  } = await fetchData({
-    syncToken,
-    reporter,
-    pluginConfig,
+  if (forceCache) {
+    // If the cache has data, use it. Otherwise do a remote fetch anyways and prime the cache now.
+    // If present, do NOT contact contentful, skip the round trips entirely
+    reporter.info(
+      `GATSBY_CONTENTFUL_EXPERIMENTAL_FORCE_CACHE was set. Skipping remote fetch, using data stored in`,
+      process.env.GATSBY_CONTENTFUL_EXPERIMENTAL_FORCE_CACHE
+    )
+    ;({
+      currentSyncData,
+      contentTypeItems,
+      defaultLocale,
+      locales,
+      space,
+    } = v8.deserialize(
+      fs.readFileSync(process.env.GATSBY_CONTENTFUL_EXPERIMENTAL_FORCE_CACHE)
+    ))
+  } else {
+    const online = await isOnline()
+
+    // If the user knows they are offline, serve them cached result
+    // For prod builds though always fail if we can't get the latest data
+    if (
+      !online &&
+      process.env.GATSBY_CONTENTFUL_OFFLINE === `true` &&
+      process.env.NODE_ENV !== `production`
+    ) {
+      getNodes().forEach(node => {
+        if (node.internal.owner !== `gatsby-source-contentful`) {
+          return
+        }
+        touchNode({ nodeId: node.id })
+        if (node.localFile___NODE) {
+          // Prevent GraphQL type inference from crashing on this property
+          touchNode({ nodeId: node.localFile___NODE })
+        }
+      })
+
+      reporter.info(`Using Contentful Offline cache ⚠️`)
+      reporter.info(
+        `Cache may be invalidated if you edit package.json, gatsby-node.js or gatsby-config.js files`
+      )
+
+      return
+    }
+    if (process.env.GATSBY_CONTENTFUL_OFFLINE) {
+      reporter.info(
+        `Note: \`GATSBY_CONTENTFUL_OFFLINE\` was set but it either was not \`true\`, we _are_ online, or we are in production mode, so the flag is ignored.`
+      )
+    }
+
+    const fetchActivity = reporter.activityTimer(
+      `Contentful: Fetch data (${sourceId})`,
+      {
+        parentSpan,
+      }
+    )
+    console.log(`runs through this part anyways`)
+    fetchActivity.start()
+    ;({
+      currentSyncData,
+      contentTypeItems,
+      defaultLocale,
+      locales,
+      space,
+    } = await fetchData({
+      syncToken,
+      reporter,
+      pluginConfig,
+      parentSpan,
+    }))
+
+    if (process.env.GATSBY_CONTENTFUL_EXPERIMENTAL_FORCE_CACHE) {
+      reporter.info(
+        `GATSBY_CONTENTFUL_EXPERIMENTAL_FORCE_CACHE was set. Writing v8 serialized glob of remote data to: ` +
+          process.env.GATSBY_CONTENTFUL_EXPERIMENTAL_FORCE_CACHE
+      )
+      fs.writeFileSync(
+        process.env.GATSBY_CONTENTFUL_EXPERIMENTAL_FORCE_CACHE,
+        v8.serialize({
+          currentSyncData,
+          contentTypeItems,
+          defaultLocale,
+          locales,
+          space,
+        })
+      )
+    }
+    fetchActivity.end()
+  }
+
+  const processingActivity = reporter.activityTimer(
+    `Contentful: Proccess data (${sourceId})`,
+    {
+      parentSpan,
+    }
+  )
+  processingActivity.start()
+
+  // Create a map of up to date entries and assets
+  function mergeSyncData(previous, current, deleted) {
+    const entryMap = new Map()
+    previous.forEach(
+      e => !deleted.includes(e.sys.id) && entryMap.set(e.sys.id, e)
+    )
+    current.forEach(
+      e => !deleted.includes(e.sys.id) && entryMap.set(e.sys.id, e)
+    )
+    return [...entryMap.values()]
+  }
+
+  const mergedSyncData = {
+    entries: mergeSyncData(
+      previousSyncData.entries,
+      currentSyncData.entries,
+      currentSyncData.deletedEntries.map(e => e.sys.id)
+    ),
+    assets: mergeSyncData(
+      previousSyncData.assets,
+      currentSyncData.assets,
+      currentSyncData.deletedAssets.map(e => e.sys.id)
+    ),
+  }
+
+  // Store a raw and unresolved copy of the data for caching
+  const mergedSyncDataRaw = _.cloneDeep(mergedSyncData)
+
+  // Use the JS-SDK to resolve the entries and assets
+  const res = createClient({
+    space: `none`,
+    accessToken: `fake-access-token`,
+  }).parseEntries({
+    items: mergedSyncData.entries,
+    includes: {
+      assets: mergedSyncData.assets,
+      entries: mergedSyncData.entries,
+    },
   })
 
+  mergedSyncData.entries = res.items
+
   const entryList = normalize.buildEntryList({
-    currentSyncData,
+    mergedSyncData,
     contentTypeItems,
   })
 
@@ -122,12 +245,17 @@ exports.sourceNodes = async (
   // are "updated" so will get the now deleted reference removed.
 
   function deleteContentfulNode(node) {
+    const normalizedType = node.sys.type.startsWith(`Deleted`)
+      ? node.sys.type.substring(`Deleted`.length)
+      : node.sys.type
+
     const localizedNodes = locales
       .map(locale => {
         const nodeId = createNodeId(
           normalize.makeId({
             spaceId: space.sys.id,
             id: node.sys.id,
+            type: normalizedType,
             currentLocale: locale.code,
             defaultLocale,
           })
@@ -151,21 +279,22 @@ exports.sourceNodes = async (
   )
   existingNodes.forEach(n => touchNode({ nodeId: n.id }))
 
-  const assets = currentSyncData.assets
+  const assets = mergedSyncData.assets
 
   reporter.info(`Updated entries ${currentSyncData.entries.length}`)
   reporter.info(`Deleted entries ${currentSyncData.deletedEntries.length}`)
   reporter.info(`Updated assets ${currentSyncData.assets.length}`)
   reporter.info(`Deleted assets ${currentSyncData.deletedAssets.length}`)
-  console.timeEnd(`Fetch Contentful data`)
 
   // Update syncToken
   const nextSyncToken = currentSyncData.nextSyncToken
 
-  // Store our sync state for the next sync.
-  const newState = {}
-  newState[createSyncToken()] = nextSyncToken
-  setPluginStatus(newState)
+  await Promise.all([
+    cache.set(CACHE_SYNC_DATA, mergedSyncDataRaw),
+    cache.set(CACHE_SYNC_TOKEN, nextSyncToken),
+  ])
+
+  reporter.verbose(`Building Contentful reference map`)
 
   // Create map of resolvable ids so we can check links against them while creating
   // links.
@@ -189,36 +318,60 @@ exports.sourceNodes = async (
     useNameForId: pluginConfig.get(`useNameForId`),
   })
 
+  reporter.verbose(`Resolving Contentful references`)
+
   const newOrUpdatedEntries = []
   entryList.forEach(entries => {
     entries.forEach(entry => {
-      newOrUpdatedEntries.push(entry.sys.id)
+      newOrUpdatedEntries.push(`${entry.sys.id}___${entry.sys.type}`)
     })
   })
 
   // Update existing entry nodes that weren't updated but that need reverse
   // links added.
   existingNodes
-    .filter(n => _.includes(newOrUpdatedEntries, n.id))
+    .filter(n => _.includes(newOrUpdatedEntries, `${n.id}___${n.sys.type}`))
     .forEach(n => {
-      if (foreignReferenceMap[n.id]) {
-        foreignReferenceMap[n.id].forEach(foreignReference => {
-          // Add reverse links
-          if (n[foreignReference.name]) {
-            n[foreignReference.name].push(foreignReference.id)
-            // It might already be there so we'll uniquify after pushing.
-            n[foreignReference.name] = _.uniq(n[foreignReference.name])
-          } else {
-            // If is one foreign reference, there can always be many.
-            // Best to be safe and put it in an array to start with.
-            n[foreignReference.name] = [foreignReference.id]
+      if (foreignReferenceMap[`${n.id}___${n.sys.type}`]) {
+        foreignReferenceMap[`${n.id}___${n.sys.type}`].forEach(
+          foreignReference => {
+            // Add reverse links
+            if (n[foreignReference.name]) {
+              n[foreignReference.name].push(foreignReference.id)
+              // It might already be there so we'll uniquify after pushing.
+              n[foreignReference.name] = _.uniq(n[foreignReference.name])
+            } else {
+              // If is one foreign reference, there can always be many.
+              // Best to be safe and put it in an array to start with.
+              n[foreignReference.name] = [foreignReference.id]
+            }
           }
-        })
+        )
       }
     })
 
+  processingActivity.end()
+
+  const creationActivity = reporter.activityTimer(
+    `Contentful: Create nodes (${sourceId})`,
+    {
+      parentSpan,
+    }
+  )
+  creationActivity.start()
+
   for (let i = 0; i < contentTypeItems.length; i++) {
     const contentTypeItem = contentTypeItems[i]
+
+    if (entryList[i].length) {
+      reporter.info(
+        `Creating ${entryList[i].length} Contentful ${
+          pluginConfig.get(`useNameForId`)
+            ? contentTypeItem.name
+            : contentTypeItem.sys.id
+        } nodes`
+      )
+    }
 
     // A contentType can hold lots of entries which create nodes
     // We wait until all nodes are created and processed until we handle the next one
@@ -243,6 +396,10 @@ exports.sourceNodes = async (
     )
   }
 
+  if (assets.length) {
+    reporter.info(`Creating ${assets.length} Contentful asset nodes`)
+  }
+
   for (let i = 0; i < assets.length; i++) {
     // We wait for each asset to be process until handling the next one.
     await Promise.all(
@@ -257,7 +414,11 @@ exports.sourceNodes = async (
     )
   }
 
+  creationActivity.end()
+
   if (pluginConfig.get(`downloadLocal`)) {
+    reporter.info(`Download Contentful asset files`)
+
     await downloadContentfulAssets({
       actions,
       createNodeId,
